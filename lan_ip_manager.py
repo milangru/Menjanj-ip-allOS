@@ -15,6 +15,7 @@ privilegije na sva tri sistema:
 import os
 import re
 import sys
+import shutil
 import platform
 import subprocess
 import threading
@@ -28,6 +29,36 @@ DEFAULT_IP = "192.168.100.101"
 DEFAULT_PREFIX = "24"
 DEFAULT_GATEWAY = "192.168.100.100"
 DEFAULT_DNS = "8.8.8.8, 1.1.1.1"
+
+
+def elevate_if_needed():
+    """
+    Ako skripta nije pokrenuta sa administratorskim/root privilegijama,
+    pokusava da se sama ponovo pokrene sa povisenim ovlascenjima:
+      - Linux: preko pkexec (graficki prompt za lozinku)
+      - Windows: preko UAC dijaloga (ShellExecute "runas")
+      - macOS: obavesti korisnika da pokrene sa sudo (osdascript prompt nije pouzdan za GUI app)
+    Ako podizanje ne uspe, nastavlja normalno (kasnije funkcije ce prijaviti gresku).
+    """
+    try:
+        if OS_NAME == "Linux":
+            if os.geteuid() != 0:
+                pkexec_path = shutil.which("pkexec")
+                if pkexec_path:
+                    os.execvp(pkexec_path, [pkexec_path, sys.executable] + sys.argv)
+                # ako pkexec ne postoji, nastavi bez elevacije (korisnik ce dobiti upozorenje u GUI-ju)
+        elif OS_NAME == "Windows":
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                params = " ".join(f'"{a}"' for a in sys.argv)
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable, params, None, 1
+                )
+                sys.exit(0)
+        # macOS: automatsko podizanje GUI aplikacije preko sudo nije pouzdano,
+        # korisnik se i dalje upozorava unutar GUI-ja ako nije root
+    except Exception:
+        pass  # tiho nastavi - upozorenje u GUI-ju ce pokriti slucaj
 
 
 # ---------------------------------------------------------------------------
@@ -418,5 +449,6 @@ class LanIpManagerApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    elevate_if_needed()
     app = LanIpManagerApp()
     app.mainloop()
