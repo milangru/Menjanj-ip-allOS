@@ -25,10 +25,10 @@ from tkinter import ttk, messagebox
 OS_NAME = platform.system()  # "Windows", "Darwin" (macOS), "Linux"
 
 # Podrazumevane (default) vrednosti za fiksnu IP
-DEFAULT_IP = "192.168.100.101"
+DEFAULT_IP = "192.168.1.10"
 DEFAULT_PREFIX = "24"
-DEFAULT_GATEWAY = "192.168.100.100"
-DEFAULT_DNS = "8.8.8.8, 1.1.1.1"
+DEFAULT_GATEWAY = "255.255.255.0"
+DEFAULT_DNS = ""
 
 
 def elevate_if_needed():
