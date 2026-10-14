@@ -45,7 +45,24 @@ def elevate_if_needed():
             if os.geteuid() != 0:
                 pkexec_path = shutil.which("pkexec")
                 if pkexec_path:
-                    os.execvp(pkexec_path, [pkexec_path, sys.executable] + sys.argv)
+                    # pkexec radi iz /root i ne prosledjuje graficke promenljive, pa:
+                    # 1) saljemo apsolutnu putanju skripte
+                    # 2) eksplicitno prosledjujemo DISPLAY/XAUTHORITY/Wayland promenljive
+                    script = os.path.abspath(sys.argv[0])
+                    env_args = []
+                    for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"):
+                        val = os.environ.get(var)
+                        if val:
+                            env_args.append(f"{var}={val}")
+                    if "XAUTHORITY" not in os.environ:
+                        default_xauth = os.path.expanduser("~/.Xauthority")
+                        if os.path.exists(default_xauth):
+                            env_args.append(f"XAUTHORITY={default_xauth}")
+                    os.execvp(
+                        pkexec_path,
+                        [pkexec_path, "env"] + env_args
+                        + [sys.executable, script] + sys.argv[1:],
+                    )
                 # ako pkexec ne postoji, nastavi bez elevacije (korisnik ce dobiti upozorenje u GUI-ju)
         elif OS_NAME == "Windows":
             import ctypes
