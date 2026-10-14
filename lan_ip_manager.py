@@ -26,9 +26,9 @@ OS_NAME = platform.system()  # "Windows", "Darwin" (macOS), "Linux"
 
 # Podrazumevane (default) vrednosti za fiksnu IP
 DEFAULT_IP = "192.168.1.10"
-DEFAULT_PREFIX = "24"
-DEFAULT_GATEWAY = "255.255.255.0"
-DEFAULT_DNS = ""
+DEFAULT_PREFIX = "24"      # /24 = maska 255.255.255.0
+DEFAULT_GATEWAY = ""       # prazno - bez podrazumevanog prolaza
+DEFAULT_DNS = ""           # prazno - bez DNS servera
 
 
 def elevate_if_needed():
