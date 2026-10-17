@@ -2,33 +2,38 @@
 """
 LAN IP Manager - cross-platform (Windows / macOS / Linux)
 
-Graficka alatka za prebacivanje zicne (Ethernet) mrezne konekcije izmedju
-automatske DHCP adrese i fiksne IP adrese, sa prikazom stvarnog trenutnog
-stanja i restartom mreznog interfejsa posle svake izmene.
+Prebacivanje zicne (Ethernet) konekcije izmedju DHCP-a i fiksne IP adrese,
+sa prikazom stvarnog trenutnog stanja i restartom mreznog interfejsa.
 
-NAPOMENA: menjanje mreznih podesavanja zahteva administratorske
-privilegije na sva tri sistema:
-    - Windows: pokrenuti "Run as Administrator"
-    - macOS / Linux: pokrenuti sa "sudo python3 lan_ip_manager.py"
+Menjanje mreznih podesavanja zahteva administratorske privilegije; skripta
+ih trazi sama (UAC na Windows-u, pkexec na Linux-u). Na macOS-u pokrenuti
+sa: sudo python3 lan_ip_manager.py
 """
 
+import ipaddress
 import os
 import re
-import sys
 import shutil
 import platform
+import queue
 import subprocess
+import sys
 import threading
+import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 OS_NAME = platform.system()  # "Windows", "Darwin" (macOS), "Linux"
 
-# Podrazumevane (default) vrednosti za fiksnu IP
+# Podrazumevane vrednosti za fiksnu IP
 DEFAULT_IP = "192.168.1.10"
 DEFAULT_PREFIX = "24"      # /24 = maska 255.255.255.0
 DEFAULT_GATEWAY = ""       # prazno - bez podrazumevanog prolaza
 DEFAULT_DNS = ""           # prazno - bez DNS servera
+
+FIXED = "Fiksna IP"
+DHCP = "Automatski (DHCP)"
 
 
 def elevate_if_needed():
@@ -82,16 +87,20 @@ def elevate_if_needed():
 # Pomocne funkcije
 # ---------------------------------------------------------------------------
 
-def run(cmd):
-    """Pokrece komandu (lista argumenata) i vraca (returncode, stdout, stderr)."""
+def run(cmd, timeout=30):
+    """Pokrece komandu; vraca (returncode, stdout, stderr)."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=20,
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
             creationflags=subprocess.CREATE_NO_WINDOW if OS_NAME == "Windows" else 0,
         )
-        return result.returncode, result.stdout, result.stderr
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
     except Exception as e:
         return 1, "", str(e)
+
+
+def powershell(script):
+    return run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], timeout=60)
 
 
 def is_admin():
@@ -105,367 +114,392 @@ def is_admin():
 
 
 def cidr_to_netmask(prefix):
-    prefix = int(prefix)
-    bits = ("1" * prefix) + ("0" * (32 - prefix))
-    return ".".join(str(int(bits[i:i + 8], 2)) for i in range(0, 32, 8))
+    return str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask)
 
 
-def netmask_to_prefix(mask):
-    try:
-        return str(sum(bin(int(x)).count("1") for x in mask.split(".")))
-    except Exception:
-        return "24"
-
-
-def parse_dns(dns_text):
-    return [d.strip() for d in dns_text.split(",") if d.strip()]
+def parse_dns(text):
+    return [d for d in re.split(r"[,\s]+", text.strip()) if d]
 
 
 # ---------------------------------------------------------------------------
-# LINUX (nmcli / ip)
+# Backend-ovi: svaki ima interfaces(), current(iface), apply(...)
+#   current(iface) -> (ip_cidr, gateway, mode)
+#   apply(iface, mode, ip_cidr, gateway, dns_list) -> (ok, poruka)
 # ---------------------------------------------------------------------------
 
-def linux_list_interfaces():
-    rc, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"])
-    ifaces = []
-    if rc == 0:
-        for line in out.strip().splitlines():
-            parts = line.split(":")
-            if len(parts) >= 2 and parts[1] == "ethernet":
-                ifaces.append(parts[0])
-    if not ifaces:
-        rc, out, _ = run(["ip", "-o", "link", "show"])
+class Linux:
+    @staticmethod
+    def interfaces():
+        _, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"])
+        devs = [l.rsplit(":", 1)[0] for l in out.splitlines() if l.endswith(":ethernet")]
+        if not devs:
+            _, out, _ = run(["ip", "-o", "link", "show"])
+            for line in out.splitlines():
+                m = re.match(r"\d+:\s+([^:@]+)", line)
+                if m and m.group(1) != "lo":
+                    devs.append(m.group(1))
+        return devs
+
+    @staticmethod
+    def _conn(dev, create=False):
+        """Ime NetworkManager profila za uredjaj (aktivan, bilo koji zicni, ili nov)."""
+        _, out, _ = run(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"])
         for line in out.splitlines():
-            m = re.match(r"\d+:\s+([^:@]+)[:@]", line)
-            if m and m.group(1) != "lo":
-                ifaces.append(m.group(1))
-    return ifaces
+            name, _, d = line.rpartition(":")
+            if d == dev:
+                return name
+        _, out, _ = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        for line in out.splitlines():
+            name, _, t = line.rpartition(":")
+            if t == "802-3-ethernet":
+                return name
+        if create:
+            name = f"LAN {dev}"
+            run(["nmcli", "connection", "add", "type", "ethernet", "ifname", dev, "con-name", name])
+            return name
+        return None
+
+    @staticmethod
+    def current(dev):
+        _, out, _ = run(["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev])
+        ip = out.splitlines()[0] if out else ""
+        _, out, _ = run(["nmcli", "-g", "IP4.GATEWAY", "device", "show", dev])
+        gw = out.splitlines()[0] if out else ""
+        mode = FIXED
+        conn = Linux._conn(dev)
+        if conn:
+            _, method, _ = run(["nmcli", "-g", "ipv4.method", "connection", "show", conn])
+            if method == "auto":
+                mode = DHCP
+        return ip, gw, mode
+
+    @staticmethod
+    def _wait_carrier(dev, seconds=15):
+        for _ in range(seconds):
+            try:
+                with open(f"/sys/class/net/{dev}/carrier") as f:
+                    if f.read().strip() == "1":
+                        return True
+            except OSError:
+                pass
+            time.sleep(1)
+        return False
+
+    @staticmethod
+    def apply(dev, mode, ip_cidr, gateway, dns):
+        conn = Linux._conn(dev, create=True)
+        if mode == DHCP:
+            args = ["ipv4.method", "auto", "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", ""]
+        else:
+            args = ["ipv4.method", "manual", "ipv4.addresses", ip_cidr,
+                    "ipv4.gateway", gateway, "ipv4.dns", ",".join(dns)]
+        rc, out, err = run(["nmcli", "connection", "modify", conn] + args)
+        if rc != 0:
+            return False, err or out
+        # Restart porta (connection down umesto device disconnect, da se ne blokira autoconnect)
+        run(["nmcli", "connection", "down", conn])
+        time.sleep(1)
+        run(["ip", "link", "set", dev, "down"])
+        time.sleep(1)
+        run(["ip", "link", "set", dev, "up"])
+        if not Linux._wait_carrier(dev):
+            run(["nmcli", "device", "set", dev, "autoconnect", "yes"])
+            return False, ("Port nema signal. Proverite mrezni kabl.\n"
+                           "Podesavanja su sacuvana i primenice se cim se pojavi signal.")
+        rc, out, err = run(["nmcli", "connection", "up", conn, "ifname", dev], timeout=60)
+        return rc == 0, err or out
 
 
-def linux_conn_name_for_device(dev):
-    for args in (["connection", "show", "--active"], ["connection", "show"]):
-        rc, out, _ = run(["nmcli", "-t", "-f", "NAME,DEVICE"] + args)
-        for line in out.strip().splitlines():
-            parts = line.split(":")
-            if len(parts) >= 2 and parts[1] == dev:
-                return parts[0]
-    return dev
+class Windows:
+    @staticmethod
+    def _q(name):
+        return name.replace("'", "''")
+
+    @staticmethod
+    def interfaces():
+        _, out, _ = powershell(
+            "Get-NetAdapter -Physical | Where-Object { $_.PhysicalMediaType -eq '802.3' } "
+            "| ForEach-Object { $_.Name }")
+        names = [l.strip() for l in out.splitlines() if l.strip()]
+        if not names:
+            _, out, _ = powershell("Get-NetAdapter -Physical | ForEach-Object { $_.Name }")
+            names = [l.strip() for l in out.splitlines() if l.strip()]
+        return names
+
+    @staticmethod
+    def current(iface):
+        q = Windows._q(iface)
+        script = (
+            f"$a = Get-NetIPAddress -InterfaceAlias '{q}' -AddressFamily IPv4 "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            f"$g = Get-NetRoute -InterfaceAlias '{q}' -DestinationPrefix '0.0.0.0/0' "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            f"$d = (Get-NetIPInterface -InterfaceAlias '{q}' -AddressFamily IPv4 "
+            "-ErrorAction SilentlyContinue).Dhcp; "
+            "Write-Output ('{0}|{1}|{2}|{3}' -f $a.IPAddress, $a.PrefixLength, $g.NextHop, $d)"
+        )
+        rc, out, _ = powershell(script)
+        parts = out.splitlines()[-1].split("|") if out else []
+        if rc != 0 or len(parts) != 4:
+            return "", "", FIXED
+        ip, prefix, gw, dhcp = (p.strip() for p in parts)
+        return (f"{ip}/{prefix}" if ip else ""), gw, (DHCP if dhcp.lower() == "enabled" else FIXED)
+
+    @staticmethod
+    def apply(iface, mode, ip_cidr, gateway, dns):
+        name = f"name={iface}"
+        if mode == DHCP:
+            steps = [
+                ["netsh", "interface", "ip", "set", "address", name, "source=dhcp"],
+                ["netsh", "interface", "ip", "set", "dnsservers", name, "source=dhcp"],
+            ]
+        else:
+            ip, prefix = ip_cidr.split("/")
+            addr = ["netsh", "interface", "ip", "set", "address", name, "source=static",
+                    f"address={ip}", f"mask={cidr_to_netmask(prefix)}"]
+            if gateway:
+                addr.append(f"gateway={gateway}")
+            steps = [addr]
+            if dns:
+                steps.append(["netsh", "interface", "ip", "set", "dnsservers", name,
+                              "source=static", f"address={dns[0]}", "validate=no"])
+                for i, d in enumerate(dns[1:], start=2):
+                    steps.append(["netsh", "interface", "ip", "add", "dnsservers", name,
+                                  f"address={d}", f"index={i}", "validate=no"])
+            else:
+                steps.append(["netsh", "interface", "ip", "set", "dnsservers", name,
+                              "source=static", "address=none"])
+        for cmd in steps:
+            rc, out, err = run(cmd)
+            if rc != 0:
+                return False, out or err or "netsh komanda nije uspela."
+        rc, out, err = powershell(f"Restart-NetAdapter -Name '{Windows._q(iface)}' -Confirm:$false")
+        if rc != 0:
+            return False, out or err or "Restart adaptera nije uspeo."
+        return True, ""
 
 
-def linux_get_current(dev):
-    ip_addr, gw = "", ""
-    rc, out, _ = run(["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev])
-    if rc == 0 and out.strip():
-        ip_addr = out.strip().splitlines()[0]
-    rc, out, _ = run(["nmcli", "-g", "IP4.GATEWAY", "device", "show", dev])
-    if rc == 0 and out.strip():
-        gw = out.strip().splitlines()[0]
-    return ip_addr, gw
+class MacOS:
+    @staticmethod
+    def interfaces():
+        _, out, _ = run(["networksetup", "-listallnetworkservices"])
+        services = [l.strip() for l in out.splitlines()[1:] if l.strip() and not l.startswith("*")]
+        # zicni servisi prvi
+        services.sort(key=lambda s: 0 if re.search(r"ethernet|lan|usb", s, re.I) else 1)
+        return services
+
+    @staticmethod
+    def current(service):
+        _, out, _ = run(["networksetup", "-getinfo", service])
+        mode = DHCP if out.startswith("DHCP") else FIXED
+        ip = re.search(r"^IP address:\s*([\d.]+)", out, re.M)
+        mask = re.search(r"^Subnet mask:\s*([\d.]+)", out, re.M)
+        gw = re.search(r"^Router:\s*([\d.]+)", out, re.M)
+        ip_cidr = ""
+        if ip:
+            prefix = ipaddress.IPv4Network(f"0.0.0.0/{mask.group(1)}").prefixlen if mask else 24
+            ip_cidr = f"{ip.group(1)}/{prefix}"
+        return ip_cidr, (gw.group(1) if gw else ""), mode
+
+    @staticmethod
+    def apply(service, mode, ip_cidr, gateway, dns):
+        if mode == DHCP:
+            steps = [["networksetup", "-setdhcp", service],
+                     ["networksetup", "-setdnsservers", service, "empty"]]
+        else:
+            ip, prefix = ip_cidr.split("/")
+            # networksetup obavezno trazi router; ako gateway nije zadat, koristi se sopstvena IP
+            steps = [["networksetup", "-setmanual", service, ip, cidr_to_netmask(prefix), gateway or ip],
+                     ["networksetup", "-setdnsservers", service] + (dns or ["empty"])]
+        for cmd in steps:
+            rc, out, err = run(cmd)
+            if rc != 0:
+                return False, out or err or "networksetup komanda nije uspela."
+        run(["networksetup", "-setnetworkserviceenabled", service, "off"])
+        time.sleep(1)
+        run(["networksetup", "-setnetworkserviceenabled", service, "on"])
+        return True, ""
 
 
-def linux_restart(dev):
-    run(["nmcli", "device", "disconnect", dev])
-    run(["ip", "link", "set", dev, "down"])
-    run(["ip", "link", "set", dev, "up"])
-    run(["nmcli", "device", "connect", dev])
-
-
-def linux_apply(dev, mode, ip_cidr, gateway, dns_csv):
-    conn = linux_conn_name_for_device(dev)
-    if mode == "dhcp":
-        run(["nmcli", "connection", "modify", conn, "ipv4.method", "auto",
-             "ipv4.addresses", "", "ipv4.gateway", "", "ipv4.dns", ""])
-    else:
-        run(["nmcli", "connection", "modify", conn, "ipv4.method", "manual",
-             "ipv4.addresses", ip_cidr])
-        run(["nmcli", "connection", "modify", conn, "ipv4.gateway", gateway or ""])
-        run(["nmcli", "connection", "modify", conn, "ipv4.dns", dns_csv or ""])
-    linux_restart(dev)
-    return run(["nmcli", "connection", "up", conn])
-
-
-# ---------------------------------------------------------------------------
-# WINDOWS (netsh)
-# ---------------------------------------------------------------------------
-
-def windows_list_interfaces():
-    rc, out, _ = run(["netsh", "interface", "show", "interface"])
-    ifaces = []
-    if rc == 0:
-        lines = out.strip().splitlines()
-        for line in lines[3:]:
-            parts = line.split(None, 3)
-            if len(parts) == 4 and parts[2].lower() == "dedicated":
-                ifaces.append(parts[3])
-    return ifaces
-
-
-def windows_get_current(iface):
-    ip_addr, gw = "", ""
-    rc, out, _ = run(["netsh", "interface", "ip", "show", "config", f"name={iface}"])
-    if rc == 0:
-        m = re.search(r"IP Address:\s*([\d.]+)", out)
-        if m:
-            ip_addr = m.group(1)
-        m2 = re.search(r"Default Gateway:\s*([\d.]+)", out)
-        if m2:
-            gw = m2.group(1)
-    return ip_addr, gw
-
-
-def windows_restart(iface):
-    run(["netsh", "interface", "set", "interface", f"name={iface}", "admin=disable"])
-    run(["netsh", "interface", "set", "interface", f"name={iface}", "admin=enable"])
-
-
-def windows_apply(iface, mode, ip_cidr, gateway, dns_list):
-    if mode == "dhcp":
-        run(["netsh", "interface", "ip", "set", "address", f"name={iface}", "dhcp"])
-        run(["netsh", "interface", "ip", "set", "dns", f"name={iface}", "dhcp"])
-    else:
-        ip_only, prefix = ip_cidr.split("/")
-        mask = cidr_to_netmask(prefix)
-        run(["netsh", "interface", "ip", "set", "address", f"name={iface}",
-             "static", ip_only, mask, gateway or "none"])
-        if dns_list:
-            run(["netsh", "interface", "ip", "set", "dns", f"name={iface}",
-                 "static", dns_list[0]])
-            for i, d in enumerate(dns_list[1:], start=2):
-                run(["netsh", "interface", "ip", "add", "dns", f"name={iface}",
-                     d, f"index={i}"])
-    windows_restart(iface)
-    return 0, "", ""
-
-
-# ---------------------------------------------------------------------------
-# macOS (networksetup)
-# ---------------------------------------------------------------------------
-
-def macos_list_interfaces():
-    rc, out, _ = run(["networksetup", "-listallnetworkservices"])
-    services = []
-    if rc == 0:
-        for line in out.strip().splitlines()[1:]:
-            if not line.startswith("*"):
-                services.append(line.strip())
-    return services
-
-
-def macos_device_for_service(service):
-    rc, out, _ = run(["networksetup", "-listallhardwareports"])
-    lines = out.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("Hardware Port:") and service in line:
-            for j in range(i, min(i + 3, len(lines))):
-                if lines[j].startswith("Device:"):
-                    return lines[j].split(":", 1)[1].strip()
-    return ""
-
-
-def macos_get_current(service):
-    ip_addr, gw = "", ""
-    dev = macos_device_for_service(service)
-    if dev:
-        rc, out, _ = run(["ipconfig", "getifaddr", dev])
-        if rc == 0:
-            ip_addr = out.strip()
-    rc, out, _ = run(["netstat", "-nr", "-f", "inet"])
-    for line in out.splitlines():
-        if line.startswith("default"):
-            parts = line.split()
-            if len(parts) > 1:
-                gw = parts[1]
-            break
-    return ip_addr, gw
-
-
-def macos_restart(service):
-    run(["networksetup", "-setnetworkserviceenabled", service, "off"])
-    run(["networksetup", "-setnetworkserviceenabled", service, "on"])
-
-
-def macos_apply(service, mode, ip_cidr, gateway, dns_list):
-    if mode == "dhcp":
-        run(["networksetup", "-setdhcp", service])
-        run(["networksetup", "-setdnsservers", service, "empty"])
-    else:
-        ip_only, prefix = ip_cidr.split("/")
-        mask = cidr_to_netmask(prefix)
-        run(["networksetup", "-setmanual", service, ip_only, mask, gateway or ""])
-        if dns_list:
-            run(["networksetup", "-setdnsservers", service] + dns_list)
-    macos_restart(service)
-    return 0, "", ""
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher - bira pravu funkciju prema OS-u
-# ---------------------------------------------------------------------------
-
-def list_interfaces():
-    if OS_NAME == "Windows":
-        return windows_list_interfaces()
-    if OS_NAME == "Darwin":
-        return macos_list_interfaces()
-    return linux_list_interfaces()
-
-
-def get_current(iface):
-    if OS_NAME == "Windows":
-        return windows_get_current(iface)
-    if OS_NAME == "Darwin":
-        return macos_get_current(iface)
-    return linux_get_current(iface)
-
-
-def apply_settings(iface, mode, ip_cidr, gateway, dns_text):
-    dns_list = parse_dns(dns_text)
-    if OS_NAME == "Windows":
-        return windows_apply(iface, mode, ip_cidr, gateway, dns_list)
-    if OS_NAME == "Darwin":
-        return macos_apply(iface, mode, ip_cidr, gateway, dns_list)
-    return linux_apply(iface, mode, ip_cidr, gateway, ", ".join(dns_list))
+BACKEND = {"Windows": Windows, "Darwin": MacOS}.get(OS_NAME, Linux)
 
 
 # ---------------------------------------------------------------------------
 # Graficki interfejs (Tkinter)
 # ---------------------------------------------------------------------------
 
-class LanIpManagerApp(tk.Tk):
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Upravljanje LAN IP adresom")
         self.resizable(False, False)
         self.configure(padx=16, pady=14)
 
-        self.interfaces = list_interfaces()
-        if not self.interfaces:
-            messagebox.showerror(
-                "Greška",
-                "Nije pronađen nijedan mrežni interfejs.\n"
-                "Proverite da li je kabl priključen i da li imate\n"
-                "administratorske privilegije."
-            )
+        self.ifaces = BACKEND.interfaces()
+        if not self.ifaces:
+            messagebox.showerror("Greska", "Nije pronadjen nijedan zicni mrezni interfejs.\n"
+                                 "Proverite da li je kabl prikljucen.")
             self.destroy()
             sys.exit(1)
 
         if not is_admin():
             messagebox.showwarning(
                 "Potrebne su administratorske privilegije",
-                "Aplikacija verovatno neće moći da primeni izmene.\n\n"
+                "Aplikacija verovatno nece moci da primeni izmene.\n\n"
                 + ("Pokrenite je kao Administrator." if OS_NAME == "Windows"
-                   else "Pokrenite je sa: sudo python3 " + os.path.basename(__file__))
-            )
+                   else "Pokrenite je sa: sudo python3 " + os.path.basename(__file__)))
 
-        self._build_widgets()
-        self._refresh_current(initial=True)
+        self._queue = queue.Queue()
+        self._build()
+        self._poll()
+        self.refresh(reset_mode=True)
 
-    # -- UI izgradnja -----------------------------------------------------
+    # -- UI ----------------------------------------------------------------
 
-    def _build_widgets(self):
-        header = ttk.Label(
-            self, text=f"Mrežni interfejs ({OS_NAME}):", font=("Segoe UI", 10, "bold")
-        )
-        header.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    def _build(self):
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        big = bold.copy()
+        big.configure(size=bold.cget("size") + 1)
+        style = ttk.Style()
+        style.configure("Cur.TLabel", foreground="#2e86de", font=big)
 
-        self.iface_var = tk.StringVar(value=self.interfaces[0])
-        iface_combo = ttk.Combobox(
-            self, textvariable=self.iface_var, values=self.interfaces,
-            state="readonly", width=32
-        )
-        iface_combo.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 10))
-        iface_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_current())
+        ttk.Label(self, text="Mrezni interfejs:").grid(row=0, column=0, sticky="w")
+        self.iface_var = tk.StringVar(value=self.ifaces[0])
+        combo = ttk.Combobox(self, textvariable=self.iface_var, values=self.ifaces,
+                             state="readonly", width=34)
+        combo.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        combo.bind("<<ComboboxSelected>>", lambda e: self.refresh(reset_mode=True))
 
-        ttk.Label(self, text="Režim rada:").grid(row=2, column=0, sticky="w")
-        self.mode_var = tk.StringVar(value="Fiksna IP")
-        mode_combo = ttk.Combobox(
-            self, textvariable=self.mode_var,
-            values=["Fiksna IP", "Automatski (DHCP)"],
-            state="readonly", width=28
-        )
-        mode_combo.grid(row=2, column=1, sticky="we", pady=4)
+        self.mode_lbl = ttk.Label(self, text="Trenutni rezim: ...", font=bold)
+        self.mode_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        ttk.Label(self, text="IP adresa i prefiks (npr. 192.168.1.50/24):").grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
+        ttk.Label(self, text="Rezim rada:").grid(row=3, column=0, sticky="w")
+        self.mode_var = tk.StringVar(value=FIXED)
+        ttk.Combobox(self, textvariable=self.mode_var, values=[FIXED, DHCP],
+                     state="readonly", width=28).grid(row=3, column=1, sticky="we", pady=4)
+
         self.ip_var = tk.StringVar(value=f"{DEFAULT_IP}/{DEFAULT_PREFIX}")
-        ttk.Entry(self, textvariable=self.ip_var, width=34).grid(
-            row=4, column=0, columnspan=2, sticky="we", pady=(0, 6)
-        )
-
-        ttk.Label(self, text="Gateway (Podrazumevani prolaz):").grid(
-            row=5, column=0, columnspan=2, sticky="w"
-        )
         self.gw_var = tk.StringVar(value=DEFAULT_GATEWAY)
-        ttk.Entry(self, textvariable=self.gw_var, width=34).grid(
-            row=6, column=0, columnspan=2, sticky="we", pady=(0, 6)
-        )
-
-        ttk.Label(self, text="DNS serveri (odvojeni zarezom):").grid(
-            row=7, column=0, columnspan=2, sticky="w"
-        )
         self.dns_var = tk.StringVar(value=DEFAULT_DNS)
-        ttk.Entry(self, textvariable=self.dns_var, width=34).grid(
-            row=8, column=0, columnspan=2, sticky="we", pady=(0, 10)
-        )
+        for row, (text, var) in enumerate((
+                ("IP adresa i prefiks (npr. 192.168.1.50/24):", self.ip_var),
+                ("Gateway (Podrazumevani prolaz):", self.gw_var),
+                ("DNS serveri (odvojeni zarezom):", self.dns_var)), start=4):
+            ttk.Label(self, text=text).grid(row=row * 2 - 4, column=0, columnspan=2,
+                                            sticky="w", pady=(8, 0))
+            ttk.Entry(self, textvariable=var, width=38).grid(row=row * 2 - 3, column=0,
+                                                              columnspan=2, sticky="we")
 
-        ttk.Separator(self).grid(row=9, column=0, columnspan=2, sticky="we", pady=6)
+        ttk.Separator(self).grid(row=10, column=0, columnspan=2, sticky="we", pady=10)
+        self.cur_ip_lbl = ttk.Label(self, text="Trenutna IP: ...", style="Cur.TLabel")
+        self.cur_ip_lbl.grid(row=11, column=0, columnspan=2, sticky="w")
+        self.cur_gw_lbl = ttk.Label(self, text="Gateway: ...", style="Cur.TLabel")
+        self.cur_gw_lbl.grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        self.current_ip_lbl = ttk.Label(self, text="🔌 Trenutna IP: ...", foreground="#2e86de")
-        self.current_ip_lbl.grid(row=10, column=0, columnspan=2, sticky="w")
-        self.current_gw_lbl = ttk.Label(self, text="🌐 Gateway: ...", foreground="#2e86de")
-        self.current_gw_lbl.grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.status_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.status_var, foreground="#888888").grid(
+            row=13, column=0, columnspan=2, sticky="w")
 
-        self.status_lbl = ttk.Label(self, text="", foreground="#888888")
-        self.status_lbl.grid(row=12, column=0, columnspan=2, sticky="w")
+        buttons = ttk.Frame(self)
+        buttons.grid(row=14, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Osvezi IP", command=self.refresh).pack(side="left", padx=4)
+        self.apply_btn = ttk.Button(buttons, text="Primeni", command=self.on_apply)
+        self.apply_btn.pack(side="left")
 
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=13, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        ttk.Button(btn_frame, text="Osveži", command=self._refresh_current).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Primeni", command=self._on_apply).pack(side="left")
+    # -- Komunikacija sa pozadinskim nitima ------------------------------------
 
-    # -- Logika -------------------------------------------------------------
+    def _post(self, func, *args):
+        """Poziva se iz pozadinske niti; func se izvrsava u glavnoj niti."""
+        self._queue.put((func, args))
 
-    def _refresh_current(self, initial=False):
+    def _poll(self):
+        try:
+            while True:
+                func, args = self._queue.get_nowait()
+                func(*args)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    # -- Logika ------------------------------------------------------------
+
+    def refresh(self, reset_mode=False):
+        """Ocitava stvarno stanje (u pozadini) i osvezava prikaz."""
         iface = self.iface_var.get()
-        ip_addr, gw = get_current(iface)
-        self.current_ip_lbl.config(text=f"🔌 Trenutna IP: {ip_addr or 'nepoznato'}")
-        self.current_gw_lbl.config(text=f"🌐 Gateway: {gw or 'nepoznato'}")
 
-    def _on_apply(self):
-        iface = self.iface_var.get()
-        mode = "dhcp" if self.mode_var.get() == "Automatski (DHCP)" else "fixed"
-        ip_cidr = self.ip_var.get().strip() or f"{DEFAULT_IP}/{DEFAULT_PREFIX}"
-        gateway = self.gw_var.get().strip() or DEFAULT_GATEWAY
-        dns_text = self.dns_var.get().strip() or DEFAULT_DNS
+        def work():
+            data = BACKEND.current(iface)
+            self._post(self._show_current, data, reset_mode)
 
-        if mode == "fixed" and "/" not in ip_cidr:
-            messagebox.showerror("Greška", "Unesite IP adresu sa prefiksom, npr. 192.168.1.50/24")
-            return
+        threading.Thread(target=work, daemon=True).start()
 
-        self.status_lbl.config(text="Primena podešavanja u toku, restart porta...")
-        self.update_idletasks()
+    def _show_current(self, data, reset_mode):
+        ip, gw, mode = data
+        self.cur_ip_lbl.config(text=f"Trenutna IP: {ip or 'nepoznato'}")
+        self.cur_gw_lbl.config(text=f"Gateway: {gw or 'nepoznato'}")
+        self.mode_lbl.config(text=f"Trenutni rezim: {mode}")
+        if reset_mode:  # padajuca lista nudi suprotan rezim od trenutnog
+            self.mode_var.set(DHCP if mode == FIXED else FIXED)
 
-        def worker():
-            apply_settings(iface, mode, ip_cidr, gateway, dns_text)
-            self.after(0, self._after_apply, mode)
+    def on_apply(self):
+        iface, mode = self.iface_var.get(), self.mode_var.get()
+        ip_cidr, gateway, dns = "", "", []
+        if mode == FIXED:
+            try:
+                text = self.ip_var.get().strip() or f"{DEFAULT_IP}/{DEFAULT_PREFIX}"
+                if "/" not in text:
+                    text += f"/{DEFAULT_PREFIX}"
+                iface_ip = ipaddress.IPv4Interface(text)
+                ip_cidr = f"{iface_ip.ip}/{iface_ip.network.prefixlen}"
+                gateway = self.gw_var.get().strip()
+                if gateway:
+                    ipaddress.IPv4Address(gateway)
+                dns = parse_dns(self.dns_var.get())
+                for d in dns:
+                    ipaddress.IPv4Address(d)
+            except ValueError as e:
+                messagebox.showerror("Greska", f"Neispravan unos: {e}")
+                return
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.apply_btn.config(state="disabled")
+        self.status_var.set("Primena u toku (restart porta), sacekajte...")
+        threading.Thread(target=self._worker, args=(iface, mode, ip_cidr, gateway, dns),
+                         daemon=True).start()
 
-    def _after_apply(self, mode):
-        self.status_lbl.config(text="")
-        self._refresh_current()
-        if mode == "dhcp":
-            messagebox.showinfo(
-                "Gotovo",
-                f"Interfejs prebačen na automatsku (DHCP) IP adresu.\n"
-                f"Dobijena IP: {self.current_ip_lbl.cget('text').replace('🔌 Trenutna IP: ', '')}"
-            )
+    def _worker(self, iface, mode, ip_cidr, gateway, dns):
+        ok, msg = BACKEND.apply(iface, mode, ip_cidr, gateway, dns)
+        expected = ip_cidr.split("/")[0] if mode == FIXED else None
+        result = None
+        if ok:  # sacekaj (do 12 s) da uredjaj stvarno dobije trazenu adresu
+            for _ in range(12):
+                ip, gw, _m = BACKEND.current(iface)
+                if ip and (expected is None or ip.split("/")[0] == expected):
+                    result = ip
+                    break
+                time.sleep(1)
+        self._post(self._done, mode, ok, msg, result, expected)
+
+    def _done(self, mode, ok, msg, result, expected):
+        self.apply_btn.config(state="normal")
+        self.status_var.set("")
+        self.refresh(reset_mode=True)
+        if not ok:
+            messagebox.showerror("Greska", msg or "Primena nije uspela.")
+        elif result:
+            what = "Prebaceno na DHCP." if mode == DHCP else "Fiksna IP primenjena."
+            messagebox.showinfo("Gotovo", f"{what}\nTrenutna IP: {result}")
+        elif mode == DHCP:
+            messagebox.showerror("Greska", "IP adresa nije dodeljena u roku od 12 s.\n"
+                                 "Proverite kabl i DHCP server.")
         else:
-            messagebox.showinfo("Gotovo", f"Fiksna IP primenjena:\n{self.ip_var.get()}")
+            messagebox.showerror("Greska", f"IP adresa {expected} nije postavljena na interfejsu.")
 
 
 if __name__ == "__main__":
-    elevate_if_needed()
-    app = LanIpManagerApp()
-    app.mainloop()
+    try:
+        elevate_if_needed()
+        App().mainloop()
+    except Exception:
+        import traceback
+        messagebox.showerror("Neocekivana greska", traceback.format_exc())
